@@ -1,0 +1,7 @@
+{
+  "name": "@fixture/app-b",
+  "private": true,
+  "dependencies": {
+    "semver": "6.3.1"
+  }
+}

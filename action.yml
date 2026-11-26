@@ -1,0 +1,156 @@
+name: 'Fast Setup Node.js'
+description: >-
+  Fast Node.js and Yarn 4 setup for GitHub Actions. Caches linked node_modules
+  and skips yarn install completely on an exact cache hit.
+
+branding:
+  icon: 'zap'
+  color: 'yellow'
+
+inputs:
+  node-version:
+    description: 'Node.js version spec to install (defaults to 24 when node-version-file is not set)'
+    required: false
+    default: ''
+  node-version-file:
+    description: 'File containing the Node.js version spec (e.g. .nvmrc, .node-version, package.json)'
+    required: false
+    default: ''
+  enable-yarn:
+    description: 'Ensure the Corepack yarn shim is enabled even on a node_modules cache hit'
+    required: false
+    default: 'false'
+  working-directory:
+    description: 'Working directory containing package.json and yarn.lock'
+    required: false
+    default: '.'
+  cache-key-prefix:
+    description: 'Optional prefix added to cache keys to scope or bust caches (e.g. per Node ABI for native addons)'
+    required: false
+    default: ''
+  cache-paths:
+    description: 'Multiline glob patterns passed to actions/cache for the linked dependency tree (defaults to **/node_modules excluding nested node_modules plus .yarn/install-state.gz)'
+    required: false
+    default: ''
+  manifest-paths:
+    description: 'Multiline glob patterns passed to hashFiles() for the node_modules cache key (defaults to yarn.lock, .yarnrc.yml, and **/package.json excluding node_modules, .yarn, and .git)'
+    required: false
+    default: ''
+
+outputs:
+  cache-hit:
+    description: 'Whether node_modules was restored from cache ("true") or installed ("false")'
+    value: ${{ steps.cache-node-modules.outputs.cache-hit == 'true' && 'true' || 'false' }}
+  node-version:
+    description: 'The installed Node.js version'
+    value: ${{ steps.setup-node.outputs.node-version }}
+
+runs:
+  using: 'composite'
+  steps:
+    # Exact-key lookup for the linked node_modules tree. No restore-keys:
+    # reconciling a stale node_modules is slower than a clean install from the
+    # Yarn download cache.
+    - name: Restore node_modules cache
+      id: cache-node-modules
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ${{ inputs.cache-paths != '' && inputs.cache-paths || format('{0}/**/node_modules', inputs.working-directory) }}
+          ${{ inputs.cache-paths == '' && format('!{0}/**/node_modules/**/node_modules', inputs.working-directory) || '' }}
+          ${{ inputs.cache-paths == '' && format('{0}/.yarn/install-state.gz', inputs.working-directory) || '' }}
+        key: >-
+          ${{ inputs.cache-key-prefix != '' && format('{0}-', inputs.cache-key-prefix) || '' }}node-modules-${{ runner.os }}-${{ runner.arch }}-${{ inputs.manifest-paths != '' && hashFiles(inputs.manifest-paths) || hashFiles(format('{0}/yarn.lock', inputs.working-directory), format('{0}/.yarnrc.yml', inputs.working-directory), format('{0}/**/package.json', inputs.working-directory), format('!{0}/**/node_modules/**', inputs.working-directory), format('!{0}/.yarn/**', inputs.working-directory), format('!{0}/.git/**', inputs.working-directory)) }}
+
+    # Enable Corepack before actions/setup-node so the runner's system Corepack
+    # shim is wired even when setup-node installs Node >= 25 (no bundled Corepack).
+    - name: Enable Corepack yarn shim (Unix)
+      if: runner.os != 'Windows' && (inputs.enable-yarn == 'true' || steps.cache-node-modules.outputs.cache-hit != 'true')
+      shell: bash
+      run: corepack enable yarn
+
+    - name: Enable Corepack yarn shim (Windows)
+      if: runner.os == 'Windows' && (inputs.enable-yarn == 'true' || steps.cache-node-modules.outputs.cache-hit != 'true')
+      shell: bash
+      run: |
+        if [ -d 'C:\npm\prefix' ]; then
+          corepack enable --install-directory 'C:\npm\prefix' yarn
+        else
+          corepack enable yarn
+        fi
+
+    - name: Setup Node.js
+      id: setup-node
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: ${{ inputs.node-version || (inputs.node-version-file == '' && '24' || '') }}
+        node-version-file: ${{ inputs.node-version-file }}
+        package-manager-cache: false
+
+    - name: Resolve Yarn cache folder
+      id: yarn-cache-dir
+      if: steps.cache-node-modules.outputs.cache-hit != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+      run: |
+        cache_dir="$(yarn config get cacheFolder | tail -n 1 | tr -d '\r')"
+        printf 'path=%s\n' "$cache_dir" >> "$GITHUB_OUTPUT"
+
+    - name: Restore Yarn download cache
+      id: cache-yarn
+      if: steps.cache-node-modules.outputs.cache-hit != 'true'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.yarn-cache-dir.outputs.path }}
+        key: >-
+          ${{ inputs.cache-key-prefix != '' && format('{0}-', inputs.cache-key-prefix) || '' }}yarn-cache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('{0}/yarn.lock', inputs.working-directory)) }}
+        restore-keys: |
+          ${{ inputs.cache-key-prefix != '' && format('{0}-', inputs.cache-key-prefix) || '' }}yarn-cache-${{ runner.os }}-${{ runner.arch }}-
+
+    # Yarn enables hardened mode on public PRs, re-verifying every package
+    # resolution against the registry (+3-7s). When HEAD is a PR merge commit
+    # (fetch-depth >= 2) and yarn.lock and .yarnrc.yml are unchanged from the
+    # base commit (HEAD^1), the lockfile is already trusted and --immutable
+    # still rejects any package.json drift.
+    - name: Install dependencies
+      if: steps.cache-node-modules.outputs.cache-hit != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+      run: |
+        if [ -z "${YARN_ENABLE_HARDENED_MODE:-}" ] \
+          && [ "$GITHUB_EVENT_NAME" = "pull_request" ] \
+          && git rev-parse --verify --quiet HEAD^2 >/dev/null 2>&1 \
+          && git diff --quiet HEAD^1 -- yarn.lock .yarnrc.yml 2>/dev/null; then
+          export YARN_ENABLE_HARDENED_MODE=false
+        fi
+        yarn install --immutable
+
+    # Save immediately after install (before test/build steps write into
+    # node_modules caches) so cache-hit jobs skip post-job saves entirely.
+    - name: Save node_modules cache
+      if: steps.cache-node-modules.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ${{ inputs.cache-paths != '' && inputs.cache-paths || format('{0}/**/node_modules', inputs.working-directory) }}
+          ${{ inputs.cache-paths == '' && format('!{0}/**/node_modules/**/node_modules', inputs.working-directory) || '' }}
+          ${{ inputs.cache-paths == '' && format('{0}/.yarn/install-state.gz', inputs.working-directory) || '' }}
+        key: ${{ steps.cache-node-modules.outputs.cache-primary-key }}
+
+    - name: Save Yarn download cache
+      if: steps.cache-node-modules.outputs.cache-hit != 'true' && steps.cache-yarn.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.yarn-cache-dir.outputs.path }}
+        key: ${{ steps.cache-yarn.outputs.cache-primary-key }}
+
+    # Expose workspace binaries (vitest, eslint, tsc, turbo, ...) on PATH so
+    # subsequent steps can invoke them directly without Yarn startup overhead.
+    - name: Add node_modules/.bin to PATH
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: node -e "const fs = require('node:fs'); const p = require('node:path').resolve('node_modules/.bin'); if (fs.existsSync(p)) fs.appendFileSync(process.env.GITHUB_PATH, p + '\n')"

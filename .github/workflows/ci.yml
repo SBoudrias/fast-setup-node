@@ -1,0 +1,178 @@
+name: CI
+
+on:
+  push:
+    branches: ['main']
+  pull_request:
+    types: [opened, synchronize]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  zizmor:
+    name: Security lint (zizmor)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # required by zizmor for workflow introspection
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@45d7276c9ca790aabd705e31ca99c6185c3e76dd # v0.8.1
+        with:
+          advanced-security: false
+
+  cold:
+    name: Cold install (${{ matrix.os }}, ${{ matrix.fixture }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        fixture: [monorepo, single]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Setup Node.js and dependencies (cold)
+        id: setup
+        uses: $/
+        with:
+          node-version: '24'
+          working-directory: fixtures/${{ matrix.fixture }}
+          cache-key-prefix: ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fixture }}
+
+      - name: Verify cold install outputs and dependencies
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.setup.outputs.cache-hit }}
+          NODE_VERSION: ${{ steps.setup.outputs.node-version }}
+          FIXTURE: ${{ matrix.fixture }}
+        run: |
+          if [ "$CACHE_HIT" != "false" ]; then
+            echo "Expected cache-hit=false on cold run, got '$CACHE_HIT'" >&2
+            exit 1
+          fi
+
+          case "$(node -v)" in
+            v24.*) ;;
+            *) echo "Expected Node v24.x, got $(node -v)" >&2; exit 1 ;;
+          esac
+
+          if [ -z "$NODE_VERSION" ]; then
+            echo "Expected non-empty node-version output" >&2
+            exit 1
+          fi
+
+          # Verify node_modules/.bin is on PATH
+          bumped="$(semver -i patch 1.0.0)"
+          if [ "$bumped" != "1.0.1" ]; then
+            echo "Expected semver CLI on PATH to output 1.0.1, got '$bumped'" >&2
+            exit 1
+          fi
+
+          # Verify installed packages (including nested workspace node_modules)
+          node -e '
+            const assert = require("node:assert/strict");
+            const path = require("node:path");
+            const fixture = process.env.FIXTURE;
+            if (fixture === "monorepo") {
+              const a = require(require.resolve("semver/package.json", { paths: [path.resolve("fixtures/monorepo/packages/app-a")] })).version;
+              const b = require(require.resolve("semver/package.json", { paths: [path.resolve("fixtures/monorepo/packages/app-b")] })).version;
+              assert.equal(a, "7.7.1");
+              assert.equal(b, "6.3.1");
+            } else {
+              const s = require(require.resolve("semver/package.json", { paths: [path.resolve("fixtures/single")] })).version;
+              assert.equal(s, "7.7.1");
+            }
+          '
+
+  warm:
+    name: Warm skip-install (${{ matrix.os }}, ${{ matrix.fixture }})
+    needs: cold
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        fixture: [monorepo, single]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      # On monorepo, switch to Node 22 with enable-yarn: true to verify
+      # cross-Node-version cache reuse and Corepack shim activation on a hit.
+      # On single, keep Node 24 with default enable-yarn: false.
+      - name: Setup Node.js and dependencies (warm)
+        id: setup
+        uses: $/
+        with:
+          node-version: ${{ matrix.fixture == 'monorepo' && '22' || '24' }}
+          enable-yarn: ${{ matrix.fixture == 'monorepo' && 'true' || 'false' }}
+          working-directory: fixtures/${{ matrix.fixture }}
+          cache-key-prefix: ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fixture }}
+
+      - name: Verify warm cache hit and restored dependencies
+        shell: bash
+        env:
+          CACHE_HIT: ${{ steps.setup.outputs.cache-hit }}
+          FIXTURE: ${{ matrix.fixture }}
+        run: |
+          if [ "$CACHE_HIT" != "true" ]; then
+            echo "Expected cache-hit=true on warm run, got '$CACHE_HIT'" >&2
+            exit 1
+          fi
+
+          # Verify .yarn/install-state.gz was restored
+          if [ ! -f "fixtures/$FIXTURE/.yarn/install-state.gz" ]; then
+            echo "Expected fixtures/$FIXTURE/.yarn/install-state.gz to be restored" >&2
+            exit 1
+          fi
+
+          # Verify node_modules/.bin is on PATH without running yarn install
+          bumped="$(semver -i patch 1.0.0)"
+          if [ "$bumped" != "1.0.1" ]; then
+            echo "Expected semver CLI on PATH to output 1.0.1, got '$bumped'" >&2
+            exit 1
+          fi
+
+          # Verify restored packages (including nested workspace node_modules)
+          node -e '
+            const assert = require("node:assert/strict");
+            const path = require("node:path");
+            const fixture = process.env.FIXTURE;
+            if (fixture === "monorepo") {
+              assert.match(process.version, /^v22\./);
+              const a = require(require.resolve("semver/package.json", { paths: [path.resolve("fixtures/monorepo/packages/app-a")] })).version;
+              const b = require(require.resolve("semver/package.json", { paths: [path.resolve("fixtures/monorepo/packages/app-b")] })).version;
+              assert.equal(a, "7.7.1");
+              assert.equal(b, "6.3.1");
+            } else {
+              assert.match(process.version, /^v24\./);
+              const s = require(require.resolve("semver/package.json", { paths: [path.resolve("fixtures/single")] })).version;
+              assert.equal(s, "7.7.1");
+            }
+          '
+
+          if [ "$FIXTURE" = "monorepo" ]; then
+            yarn_version="$(cd fixtures/monorepo && yarn --version | tr -d '\r')"
+            if [ "$yarn_version" != "4.18.1" ]; then
+              echo "Expected yarn 4.18.1 when enable-yarn=true, got '$yarn_version'" >&2
+              exit 1
+            fi
+          fi
