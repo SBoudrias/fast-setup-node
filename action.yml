@@ -1,7 +1,7 @@
 name: 'Fast Setup Node.js'
 description: >-
-  Fast Node.js setup for GitHub Actions (Yarn 4, npm, pnpm). Caches linked
-  node_modules and skips install completely on an exact cache hit.
+  Fast Node.js setup for GitHub Actions: Yarn 4, npm, pnpm. Caches
+  node_modules and skips install on an exact cache hit.
 
 branding:
   icon: 'zap'
