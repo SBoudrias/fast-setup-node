@@ -32,13 +32,14 @@ jobs:
           advanced-security: false
 
   cold:
-    name: Cold install (${{ matrix.os }}, ${{ matrix.fixture }})
+    name: Cold install (${{ matrix.os }}, ${{ matrix.pm }}-${{ matrix.layout }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        fixture: [monorepo, single]
+        pm: [yarn, npm, pnpm]
+        layout: [monorepo, single]
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -51,18 +52,25 @@ jobs:
         uses: $/
         with:
           node-version: '24'
-          working-directory: fixtures/${{ matrix.fixture }}
-          cache-key-prefix: ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fixture }}
+          working-directory: fixtures/${{ matrix.pm }}-${{ matrix.layout }}
+          cache-key-prefix: ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.pm }}-${{ matrix.layout }}
 
       - name: Verify cold install outputs and dependencies
         shell: bash
         env:
           CACHE_HIT: ${{ steps.setup.outputs.cache-hit }}
           NODE_VERSION: ${{ steps.setup.outputs.node-version }}
-          FIXTURE: ${{ matrix.fixture }}
+          DETECTED_PM: ${{ steps.setup.outputs.package-manager }}
+          EXPECTED_PM: ${{ matrix.pm }}
+          LAYOUT: ${{ matrix.layout }}
         run: |
           if [ "$CACHE_HIT" != "false" ]; then
             echo "Expected cache-hit=false on cold run, got '$CACHE_HIT'" >&2
+            exit 1
+          fi
+
+          if [ "$DETECTED_PM" != "$EXPECTED_PM" ]; then
+            echo "Expected package-manager='$EXPECTED_PM', got '$DETECTED_PM'" >&2
             exit 1
           fi
 
@@ -87,27 +95,28 @@ jobs:
           node -e '
             const assert = require("node:assert/strict");
             const path = require("node:path");
-            const fixture = process.env.FIXTURE;
-            if (fixture === "monorepo") {
-              const a = require(require.resolve("semver/package.json", { paths: [path.resolve("fixtures/monorepo/packages/app-a")] })).version;
-              const b = require(require.resolve("semver/package.json", { paths: [path.resolve("fixtures/monorepo/packages/app-b")] })).version;
+            const dir = `fixtures/${process.env.EXPECTED_PM}-${process.env.LAYOUT}`;
+            if (process.env.LAYOUT === "monorepo") {
+              const a = require(require.resolve("semver/package.json", { paths: [path.resolve(dir, "packages/app-a")] })).version;
+              const b = require(require.resolve("semver/package.json", { paths: [path.resolve(dir, "packages/app-b")] })).version;
               assert.equal(a, "7.7.1");
               assert.equal(b, "6.3.1");
             } else {
-              const s = require(require.resolve("semver/package.json", { paths: [path.resolve("fixtures/single")] })).version;
+              const s = require(require.resolve("semver/package.json", { paths: [path.resolve(dir)] })).version;
               assert.equal(s, "7.7.1");
             }
           '
 
   warm:
-    name: Warm skip-install (${{ matrix.os }}, ${{ matrix.fixture }})
+    name: Warm skip-install (${{ matrix.os }}, ${{ matrix.pm }}-${{ matrix.layout }})
     needs: cold
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        fixture: [monorepo, single]
+        pm: [yarn, npm, pnpm]
+        layout: [monorepo, single]
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -115,36 +124,45 @@ jobs:
           persist-credentials: false
           fetch-depth: 2
 
-      # On monorepo, switch to Node 22 with enable-yarn: true to verify
-      # cross-Node-version cache reuse and Corepack shim activation on a hit.
-      # On single, keep Node 24 with default enable-yarn: false.
+      # On monorepo, switch to Node 22 with enable-package-manager: true to
+      # verify cross-Node-version cache reuse and CLI shim activation on a hit.
+      # On single, keep Node 24 with default enable-package-manager: false.
       - name: Setup Node.js and dependencies (warm)
         id: setup
         uses: $/
         with:
-          node-version: ${{ matrix.fixture == 'monorepo' && '22' || '24' }}
-          enable-yarn: ${{ matrix.fixture == 'monorepo' && 'true' || 'false' }}
-          working-directory: fixtures/${{ matrix.fixture }}
-          cache-key-prefix: ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.fixture }}
+          node-version: ${{ matrix.layout == 'monorepo' && '22' || '24' }}
+          enable-package-manager: ${{ matrix.layout == 'monorepo' && 'true' || 'false' }}
+          working-directory: fixtures/${{ matrix.pm }}-${{ matrix.layout }}
+          cache-key-prefix: ci-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.pm }}-${{ matrix.layout }}
 
       - name: Verify warm cache hit and restored dependencies
         shell: bash
         env:
           CACHE_HIT: ${{ steps.setup.outputs.cache-hit }}
-          FIXTURE: ${{ matrix.fixture }}
+          DETECTED_PM: ${{ steps.setup.outputs.package-manager }}
+          EXPECTED_PM: ${{ matrix.pm }}
+          LAYOUT: ${{ matrix.layout }}
         run: |
           if [ "$CACHE_HIT" != "true" ]; then
             echo "Expected cache-hit=true on warm run, got '$CACHE_HIT'" >&2
             exit 1
           fi
 
-          # Verify .yarn/install-state.gz was restored
-          if [ ! -f "fixtures/$FIXTURE/.yarn/install-state.gz" ]; then
-            echo "Expected fixtures/$FIXTURE/.yarn/install-state.gz to be restored" >&2
+          if [ "$DETECTED_PM" != "$EXPECTED_PM" ]; then
+            echo "Expected package-manager='$EXPECTED_PM', got '$DETECTED_PM'" >&2
             exit 1
           fi
 
-          # Verify node_modules/.bin is on PATH without running yarn install
+          dir="fixtures/$EXPECTED_PM-$LAYOUT"
+
+          # Verify Yarn install-state was restored
+          if [ "$EXPECTED_PM" = "yarn" ] && [ ! -f "$dir/.yarn/install-state.gz" ]; then
+            echo "Expected $dir/.yarn/install-state.gz to be restored" >&2
+            exit 1
+          fi
+
+          # Verify node_modules/.bin is on PATH without running install
           bumped="$(semver -i patch 1.0.0)"
           if [ "$bumped" != "1.0.1" ]; then
             echo "Expected semver CLI on PATH to output 1.0.1, got '$bumped'" >&2
@@ -155,24 +173,43 @@ jobs:
           node -e '
             const assert = require("node:assert/strict");
             const path = require("node:path");
-            const fixture = process.env.FIXTURE;
-            if (fixture === "monorepo") {
+            const dir = `fixtures/${process.env.EXPECTED_PM}-${process.env.LAYOUT}`;
+            if (process.env.LAYOUT === "monorepo") {
               assert.match(process.version, /^v22\./);
-              const a = require(require.resolve("semver/package.json", { paths: [path.resolve("fixtures/monorepo/packages/app-a")] })).version;
-              const b = require(require.resolve("semver/package.json", { paths: [path.resolve("fixtures/monorepo/packages/app-b")] })).version;
+              const a = require(require.resolve("semver/package.json", { paths: [path.resolve(dir, "packages/app-a")] })).version;
+              const b = require(require.resolve("semver/package.json", { paths: [path.resolve(dir, "packages/app-b")] })).version;
               assert.equal(a, "7.7.1");
               assert.equal(b, "6.3.1");
             } else {
               assert.match(process.version, /^v24\./);
-              const s = require(require.resolve("semver/package.json", { paths: [path.resolve("fixtures/single")] })).version;
+              const s = require(require.resolve("semver/package.json", { paths: [path.resolve(dir)] })).version;
               assert.equal(s, "7.7.1");
             }
           '
 
-          if [ "$FIXTURE" = "monorepo" ]; then
-            yarn_version="$(cd fixtures/monorepo && yarn --version | tr -d '\r')"
-            if [ "$yarn_version" != "4.18.1" ]; then
-              echo "Expected yarn 4.18.1 when enable-yarn=true, got '$yarn_version'" >&2
-              exit 1
-            fi
+          # Verify the package manager CLI is available on monorepo warm hits
+          if [ "$LAYOUT" = "monorepo" ]; then
+            case "$EXPECTED_PM" in
+              yarn)
+                ver="$(cd "$dir" && yarn --version | tr -d '\r')"
+                if [ "$ver" != "4.18.1" ]; then
+                  echo "Expected yarn 4.18.1, got '$ver'" >&2
+                  exit 1
+                fi
+                ;;
+              pnpm)
+                ver="$(cd "$dir" && pnpm --version | tr -d '\r')"
+                if [ "$ver" != "10.28.2" ]; then
+                  echo "Expected pnpm 10.28.2, got '$ver'" >&2
+                  exit 1
+                fi
+                ;;
+              npm)
+                ver="$(cd "$dir" && npm --version | tr -d '\r')"
+                if [ -z "$ver" ]; then
+                  echo "Expected non-empty npm version" >&2
+                  exit 1
+                fi
+                ;;
+            esac
           fi

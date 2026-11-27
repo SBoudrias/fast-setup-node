@@ -1,0 +1,7 @@
+{
+  "name": "fixture-npm-single",
+  "private": true,
+  "dependencies": {
+    "semver": "7.7.1"
+  }
+}
