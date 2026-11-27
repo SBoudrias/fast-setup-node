@@ -1,7 +1,7 @@
 name: 'Fast Setup Node.js'
 description: >-
-  Fast Node.js and Yarn 4 setup for GitHub Actions. Caches linked node_modules
-  and skips yarn install completely on an exact cache hit.
+  Fast Node.js setup for GitHub Actions (Yarn 4, npm, pnpm). Caches linked
+  node_modules and skips install completely on an exact cache hit.
 
 branding:
   icon: 'zap'
@@ -16,12 +16,20 @@ inputs:
     description: 'File containing the Node.js version spec (e.g. .nvmrc, .node-version, package.json)'
     required: false
     default: ''
+  package-manager:
+    description: 'Package manager to use: auto, yarn, npm, or pnpm (defaults to auto-detecting from packageManager field and lockfiles)'
+    required: false
+    default: 'auto'
+  enable-package-manager:
+    description: 'Ensure the Corepack shim (yarn/pnpm) is enabled even on a node_modules cache hit (npm is always available via Node.js)'
+    required: false
+    default: 'false'
   enable-yarn:
-    description: 'Ensure the Corepack yarn shim is enabled even on a node_modules cache hit'
+    description: 'Alias for enable-package-manager when using Yarn'
     required: false
     default: 'false'
   working-directory:
-    description: 'Working directory containing package.json and yarn.lock'
+    description: 'Working directory containing package.json and lockfile'
     required: false
     default: '.'
   cache-key-prefix:
@@ -29,11 +37,11 @@ inputs:
     required: false
     default: ''
   cache-paths:
-    description: 'Multiline glob patterns passed to actions/cache for the linked dependency tree (defaults to **/node_modules excluding nested node_modules plus .yarn/install-state.gz)'
+    description: 'Multiline glob patterns passed to actions/cache for the linked dependency tree (defaults to **/node_modules excluding nested node_modules, plus .yarn/install-state.gz for Yarn)'
     required: false
     default: ''
   manifest-paths:
-    description: 'Multiline glob patterns passed to hashFiles() for the node_modules cache key (defaults to yarn.lock, .yarnrc.yml, and **/package.json excluding node_modules, .yarn, and .git)'
+    description: 'Multiline glob patterns passed to hashFiles() for the node_modules cache key (defaults to the package manager lockfile, config files, and **/package.json excluding node_modules/.yarn/.git)'
     required: false
     default: ''
 
@@ -44,39 +52,147 @@ outputs:
   node-version:
     description: 'The installed Node.js version'
     value: ${{ steps.setup-node.outputs.node-version }}
+  package-manager:
+    description: 'The resolved package manager ("yarn", "npm", or "pnpm")'
+    value: ${{ steps.detect.outputs.package-manager }}
 
 runs:
   using: 'composite'
   steps:
+    - name: Detect package manager and cache configuration
+      id: detect
+      shell: bash
+      env:
+        INPUT_PACKAGE_MANAGER: ${{ inputs.package-manager }}
+        INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        INPUT_CACHE_PATHS: ${{ inputs.cache-paths }}
+        INPUT_MANIFEST_PATHS: ${{ inputs.manifest-paths }}
+      run: |
+        wd="${INPUT_WORKING_DIRECTORY:-.}"
+        while [ "${#wd}" -gt 1 ] && [ "${wd%/}" != "$wd" ]; do
+          wd="${wd%/}"
+        done
+
+        if [ ! -d "$wd" ]; then
+          echo "::error::working-directory '$wd' does not exist."
+          exit 1
+        fi
+
+        pm="${INPUT_PACKAGE_MANAGER:-auto}"
+        if [ "$pm" = "auto" ]; then
+          if [ -f "$wd/package.json" ]; then
+            declared="$(sed -n 's/.*"packageManager"[[:space:]]*:[[:space:]]*"\([^"@]*\)@.*/\1/p' "$wd/package.json" | head -n 1)"
+            case "$declared" in
+              yarn|npm|pnpm) pm="$declared" ;;
+            esac
+          fi
+
+          if [ "$pm" = "auto" ]; then
+            if [ -f "$wd/pnpm-lock.yaml" ]; then
+              pm="pnpm"
+            elif [ -f "$wd/yarn.lock" ]; then
+              pm="yarn"
+            elif [ -f "$wd/npm-shrinkwrap.json" ] || [ -f "$wd/package-lock.json" ]; then
+              pm="npm"
+            else
+              echo "::error::Could not detect package manager in '$wd'. Commit a lockfile (yarn.lock, package-lock.json, npm-shrinkwrap.json, or pnpm-lock.yaml), set packageManager in package.json, or pass the package-manager input."
+              exit 1
+            fi
+          fi
+        fi
+
+        case "$pm" in
+          yarn)
+            lockfile="$wd/yarn.lock"
+            default_cache_paths="$(printf '%s/**/node_modules\n!%s/**/node_modules/**/node_modules\n%s/.yarn/install-state.gz' "$wd" "$wd" "$wd")"
+            default_manifest_paths="$(printf '%s/yarn.lock\n%s/.yarnrc.yml\n%s/**/package.json\n!%s/**/node_modules/**\n!%s/.yarn/**\n!%s/.git/**' "$wd" "$wd" "$wd" "$wd" "$wd" "$wd")"
+            ;;
+          pnpm)
+            lockfile="$wd/pnpm-lock.yaml"
+            default_cache_paths="$(printf '%s/**/node_modules\n!%s/**/node_modules/**/node_modules' "$wd" "$wd")"
+            default_manifest_paths="$(printf '%s/pnpm-lock.yaml\n%s/pnpm-workspace.yaml\n%s/.npmrc\n%s/**/package.json\n!%s/**/node_modules/**\n!%s/.git/**' "$wd" "$wd" "$wd" "$wd" "$wd" "$wd")"
+            ;;
+          npm)
+            if [ -f "$wd/npm-shrinkwrap.json" ]; then
+              lockfile="$wd/npm-shrinkwrap.json"
+            else
+              lockfile="$wd/package-lock.json"
+            fi
+            default_cache_paths="$(printf '%s/**/node_modules\n!%s/**/node_modules/**/node_modules' "$wd" "$wd")"
+            default_manifest_paths="$(printf '%s\n%s/.npmrc\n%s/**/package.json\n!%s/**/node_modules/**\n!%s/.git/**' "$lockfile" "$wd" "$wd" "$wd" "$wd")"
+            ;;
+          *)
+            echo "::error::Unsupported package-manager '$pm'. Expected 'auto', 'yarn', 'npm', or 'pnpm'."
+            exit 1
+            ;;
+        esac
+
+        cache_paths="${INPUT_CACHE_PATHS:-$default_cache_paths}"
+        manifest_paths="${INPUT_MANIFEST_PATHS:-$default_manifest_paths}"
+
+        delim="__FAST_SETUP_NODE_EOF__"
+        {
+          printf 'package-manager=%s\n' "$pm"
+          printf 'lockfile=%s\n' "$lockfile"
+          printf 'cache-paths<<%s\n%s\n%s\n' "$delim" "$cache_paths" "$delim"
+          printf 'manifest-paths<<%s\n%s\n%s\n' "$delim" "$manifest_paths" "$delim"
+        } >> "$GITHUB_OUTPUT"
+
     # Exact-key lookup for the linked node_modules tree. No restore-keys:
     # reconciling a stale node_modules is slower than a clean install from the
-    # Yarn download cache.
+    # package manager download cache.
     - name: Restore node_modules cache
       id: cache-node-modules
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        path: |
-          ${{ inputs.cache-paths != '' && inputs.cache-paths || format('{0}/**/node_modules', inputs.working-directory) }}
-          ${{ inputs.cache-paths == '' && format('!{0}/**/node_modules/**/node_modules', inputs.working-directory) || '' }}
-          ${{ inputs.cache-paths == '' && format('{0}/.yarn/install-state.gz', inputs.working-directory) || '' }}
+        path: ${{ steps.detect.outputs.cache-paths }}
         key: >-
-          ${{ inputs.cache-key-prefix != '' && format('{0}-', inputs.cache-key-prefix) || '' }}node-modules-${{ runner.os }}-${{ runner.arch }}-${{ inputs.manifest-paths != '' && hashFiles(inputs.manifest-paths) || hashFiles(format('{0}/yarn.lock', inputs.working-directory), format('{0}/.yarnrc.yml', inputs.working-directory), format('{0}/**/package.json', inputs.working-directory), format('!{0}/**/node_modules/**', inputs.working-directory), format('!{0}/.yarn/**', inputs.working-directory), format('!{0}/.git/**', inputs.working-directory)) }}
+          ${{ inputs.cache-key-prefix != '' && format('{0}-', inputs.cache-key-prefix) || '' }}node-modules-${{ steps.detect.outputs.package-manager }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(steps.detect.outputs.manifest-paths) }}
 
     # Enable Corepack before actions/setup-node so the runner's system Corepack
     # shim is wired even when setup-node installs Node >= 25 (no bundled Corepack).
-    - name: Enable Corepack yarn shim (Unix)
-      if: runner.os != 'Windows' && (inputs.enable-yarn == 'true' || steps.cache-node-modules.outputs.cache-hit != 'true')
+    - name: Enable Corepack shim (Unix)
+      if: >-
+        runner.os != 'Windows'
+        && steps.detect.outputs.package-manager != 'npm'
+        && (
+          inputs.enable-package-manager == 'true'
+          || (inputs.enable-yarn == 'true' && steps.detect.outputs.package-manager == 'yarn')
+          || steps.cache-node-modules.outputs.cache-hit != 'true'
+        )
       shell: bash
-      run: corepack enable yarn
-
-    - name: Enable Corepack yarn shim (Windows)
-      if: runner.os == 'Windows' && (inputs.enable-yarn == 'true' || steps.cache-node-modules.outputs.cache-hit != 'true')
-      shell: bash
+      env:
+        PM: ${{ steps.detect.outputs.package-manager }}
       run: |
-        if [ -d 'C:\npm\prefix' ]; then
-          corepack enable --install-directory 'C:\npm\prefix' yarn
-        else
-          corepack enable yarn
+        if command -v corepack >/dev/null 2>&1; then
+          corepack enable "$PM"
+        elif ! command -v "$PM" >/dev/null 2>&1; then
+          echo "::error::Neither corepack nor '$PM' is available on PATH."
+          exit 1
+        fi
+
+    - name: Enable Corepack shim (Windows)
+      if: >-
+        runner.os == 'Windows'
+        && steps.detect.outputs.package-manager != 'npm'
+        && (
+          inputs.enable-package-manager == 'true'
+          || (inputs.enable-yarn == 'true' && steps.detect.outputs.package-manager == 'yarn')
+          || steps.cache-node-modules.outputs.cache-hit != 'true'
+        )
+      shell: bash
+      env:
+        PM: ${{ steps.detect.outputs.package-manager }}
+      run: |
+        if command -v corepack >/dev/null 2>&1; then
+          if [ -d 'C:\npm\prefix' ]; then
+            corepack enable --install-directory 'C:\npm\prefix' "$PM"
+          else
+            corepack enable "$PM"
+          fi
+        elif ! command -v "$PM" >/dev/null 2>&1; then
+          echo "::error::Neither corepack nor '$PM' is available on PATH."
+          exit 1
         fi
 
     - name: Setup Node.js
@@ -87,30 +203,41 @@ runs:
         node-version-file: ${{ inputs.node-version-file }}
         package-manager-cache: false
 
-    - name: Resolve Yarn cache folder
-      id: yarn-cache-dir
+    - name: Resolve package manager cache folder
+      id: pm-cache-dir
       if: steps.cache-node-modules.outputs.cache-hit != 'true'
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
+        PM: ${{ steps.detect.outputs.package-manager }}
         COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
       run: |
-        cache_dir="$(yarn config get cacheFolder | tail -n 1 | tr -d '\r')"
+        case "$PM" in
+          yarn)
+            cache_dir="$(yarn config get cacheFolder | tail -n 1 | tr -d '\r')"
+            ;;
+          pnpm)
+            cache_dir="$(pnpm store path | tail -n 1 | tr -d '\r')"
+            ;;
+          npm)
+            cache_dir="$(npm config get cache | tail -n 1 | tr -d '\r')"
+            ;;
+        esac
         printf 'path=%s\n' "$cache_dir" >> "$GITHUB_OUTPUT"
 
-    - name: Restore Yarn download cache
-      id: cache-yarn
+    - name: Restore package manager cache
+      id: cache-pm
       if: steps.cache-node-modules.outputs.cache-hit != 'true'
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        path: ${{ steps.yarn-cache-dir.outputs.path }}
+        path: ${{ steps.pm-cache-dir.outputs.path }}
         key: >-
-          ${{ inputs.cache-key-prefix != '' && format('{0}-', inputs.cache-key-prefix) || '' }}yarn-cache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('{0}/yarn.lock', inputs.working-directory)) }}
+          ${{ inputs.cache-key-prefix != '' && format('{0}-', inputs.cache-key-prefix) || '' }}${{ steps.detect.outputs.package-manager }}-cache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(steps.detect.outputs.lockfile) }}
         restore-keys: |
-          ${{ inputs.cache-key-prefix != '' && format('{0}-', inputs.cache-key-prefix) || '' }}yarn-cache-${{ runner.os }}-${{ runner.arch }}-
+          ${{ inputs.cache-key-prefix != '' && format('{0}-', inputs.cache-key-prefix) || '' }}${{ steps.detect.outputs.package-manager }}-cache-${{ runner.os }}-${{ runner.arch }}-
 
-    # Yarn enables hardened mode on public PRs, re-verifying every package
-    # resolution against the registry (+3-7s). When HEAD is a PR merge commit
+    # On Yarn public PRs, hardened mode re-verifies every package resolution
+    # against the registry (+3-7s). When HEAD is a PR merge commit
     # (fetch-depth >= 2) and yarn.lock and .yarnrc.yml are unchanged from the
     # base commit (HEAD^1), the lockfile is already trusted and --immutable
     # still rejects any package.json drift.
@@ -119,15 +246,26 @@ runs:
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
+        PM: ${{ steps.detect.outputs.package-manager }}
         COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
       run: |
-        if [ -z "${YARN_ENABLE_HARDENED_MODE:-}" ] \
-          && [ "$GITHUB_EVENT_NAME" = "pull_request" ] \
-          && git rev-parse --verify --quiet HEAD^2 >/dev/null 2>&1 \
-          && git diff --quiet HEAD^1 -- yarn.lock .yarnrc.yml 2>/dev/null; then
-          export YARN_ENABLE_HARDENED_MODE=false
-        fi
-        yarn install --immutable
+        case "$PM" in
+          yarn)
+            if [ -z "${YARN_ENABLE_HARDENED_MODE:-}" ] \
+              && [ "$GITHUB_EVENT_NAME" = "pull_request" ] \
+              && git rev-parse --verify --quiet HEAD^2 >/dev/null 2>&1 \
+              && git diff --quiet HEAD^1 -- yarn.lock .yarnrc.yml 2>/dev/null; then
+              export YARN_ENABLE_HARDENED_MODE=false
+            fi
+            yarn install --immutable
+            ;;
+          pnpm)
+            pnpm install --frozen-lockfile --prefer-offline
+            ;;
+          npm)
+            npm ci --prefer-offline --no-audit --no-fund
+            ;;
+        esac
 
     # Save immediately after install (before test/build steps write into
     # node_modules caches) so cache-hit jobs skip post-job saves entirely.
@@ -135,21 +273,18 @@ runs:
       if: steps.cache-node-modules.outputs.cache-hit != 'true'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        path: |
-          ${{ inputs.cache-paths != '' && inputs.cache-paths || format('{0}/**/node_modules', inputs.working-directory) }}
-          ${{ inputs.cache-paths == '' && format('!{0}/**/node_modules/**/node_modules', inputs.working-directory) || '' }}
-          ${{ inputs.cache-paths == '' && format('{0}/.yarn/install-state.gz', inputs.working-directory) || '' }}
+        path: ${{ steps.detect.outputs.cache-paths }}
         key: ${{ steps.cache-node-modules.outputs.cache-primary-key }}
 
-    - name: Save Yarn download cache
-      if: steps.cache-node-modules.outputs.cache-hit != 'true' && steps.cache-yarn.outputs.cache-hit != 'true'
+    - name: Save package manager cache
+      if: steps.cache-node-modules.outputs.cache-hit != 'true' && steps.cache-pm.outputs.cache-hit != 'true'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        path: ${{ steps.yarn-cache-dir.outputs.path }}
-        key: ${{ steps.cache-yarn.outputs.cache-primary-key }}
+        path: ${{ steps.pm-cache-dir.outputs.path }}
+        key: ${{ steps.cache-pm.outputs.cache-primary-key }}
 
     # Expose workspace binaries (vitest, eslint, tsc, turbo, ...) on PATH so
-    # subsequent steps can invoke them directly without Yarn startup overhead.
+    # subsequent steps can invoke them directly without package manager overhead.
     - name: Add node_modules/.bin to PATH
       shell: bash
       working-directory: ${{ inputs.working-directory }}

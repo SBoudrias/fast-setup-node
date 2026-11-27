@@ -1,0 +1,8 @@
+{
+  "name": "fixture-pnpm-monorepo",
+  "private": true,
+  "packageManager": "pnpm@10.28.2",
+  "devDependencies": {
+    "semver": "7.7.1"
+  }
+}
