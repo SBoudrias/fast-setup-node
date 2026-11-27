@@ -16,14 +16,6 @@ inputs:
     description: 'File containing the Node.js version spec (e.g. .nvmrc, .node-version, package.json)'
     required: false
     default: ''
-  package-manager:
-    description: 'Package manager to use: auto, yarn, npm, or pnpm (defaults to auto-detecting from packageManager field and lockfiles)'
-    required: false
-    default: 'auto'
-  enable-package-manager:
-    description: 'Ensure the package manager CLI shim (yarn/pnpm via Corepack) is enabled even on a node_modules cache hit (npm is always available via Node.js)'
-    required: false
-    default: 'false'
   working-directory:
     description: 'Working directory containing package.json and lockfile'
     required: false
@@ -59,80 +51,152 @@ runs:
       id: detect
       shell: bash
       env:
-        INPUT_PACKAGE_MANAGER: ${{ inputs.package-manager }}
         INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
         INPUT_CACHE_PATHS: ${{ inputs.cache-paths }}
         INPUT_MANIFEST_PATHS: ${{ inputs.manifest-paths }}
       run: |
-        wd="${INPUT_WORKING_DIRECTORY:-.}"
-        while [ "${#wd}" -gt 1 ] && [ "${wd%/}" != "$wd" ]; do
-          wd="${wd%/}"
-        done
+        node -e '
+          const crypto = require("node:crypto");
+          const fs = require("node:fs");
+          const os = require("node:os");
+          const path = require("node:path");
 
-        if [ ! -d "$wd" ]; then
-          echo "::error::working-directory '$wd' does not exist."
-          exit 1
-        fi
+          function fail(msg) {
+            console.log(`::error::${msg}`);
+            process.exit(1);
+          }
 
-        pm="${INPUT_PACKAGE_MANAGER:-auto}"
-        if [ "$pm" = "auto" ]; then
-          if [ -f "$wd/package.json" ]; then
-            declared="$(node -e 'try { const pm = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).packageManager; if (typeof pm === "string") console.log(pm.split("@")[0]); } catch {}' "$wd/package.json" 2>/dev/null || true)"
-            case "$declared" in
-              yarn|npm|pnpm) pm="$declared" ;;
-            esac
-          fi
+          const wdRaw = process.env.INPUT_WORKING_DIRECTORY || ".";
+          const wd = wdRaw.replace(/[/\\]+$/, "") || ".";
+          if (!fs.existsSync(wd) || !fs.statSync(wd).isDirectory()) {
+            fail(`working-directory "${wd}" does not exist.`);
+          }
 
-          if [ "$pm" = "auto" ]; then
-            if [ -f "$wd/pnpm-lock.yaml" ]; then
-              pm="pnpm"
-            elif [ -f "$wd/yarn.lock" ]; then
-              pm="yarn"
-            elif [ -f "$wd/npm-shrinkwrap.json" ] || [ -f "$wd/package-lock.json" ]; then
-              pm="npm"
-            else
-              echo "::error::Could not detect package manager in '$wd'. Commit a lockfile (yarn.lock, package-lock.json, npm-shrinkwrap.json, or pnpm-lock.yaml), set packageManager in package.json, or pass the package-manager input."
-              exit 1
-            fi
-          fi
-        fi
+          const pkgPath = path.join(wd, "package.json");
+          let pmSpec = "";
+          if (fs.existsSync(pkgPath)) {
+            let pkg;
+            try {
+              pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+            } catch (err) {
+              fail(`Failed to parse ${pkgPath}: ${err.message}`);
+            }
+            if (typeof pkg.packageManager === "string" && pkg.packageManager.trim() !== "") {
+              pmSpec = pkg.packageManager.trim();
+            }
+          }
 
-        case "$pm" in
-          yarn)
-            lockfile="$wd/yarn.lock"
-            default_cache_paths="$(printf '%s/**/node_modules\n!%s/**/node_modules/**/node_modules\n%s/.yarn/install-state.gz' "$wd" "$wd" "$wd")"
-            default_manifest_paths="$(printf '%s/yarn.lock\n%s/.yarnrc.yml\n%s/**/package.json\n!%s/**/node_modules/**\n!%s/.yarn/**\n!%s/.git/**' "$wd" "$wd" "$wd" "$wd" "$wd" "$wd")"
-            ;;
-          pnpm)
-            lockfile="$wd/pnpm-lock.yaml"
-            default_cache_paths="$(printf '%s/**/node_modules\n!%s/**/node_modules/**/node_modules' "$wd" "$wd")"
-            default_manifest_paths="$(printf '%s/pnpm-lock.yaml\n%s/pnpm-workspace.yaml\n%s/.npmrc\n%s/**/package.json\n!%s/**/node_modules/**\n!%s/.git/**' "$wd" "$wd" "$wd" "$wd" "$wd" "$wd")"
-            ;;
-          npm)
-            if [ -f "$wd/npm-shrinkwrap.json" ]; then
-              lockfile="$wd/npm-shrinkwrap.json"
-            else
-              lockfile="$wd/package-lock.json"
-            fi
-            default_cache_paths="$(printf '%s/**/node_modules\n!%s/**/node_modules/**/node_modules' "$wd" "$wd")"
-            default_manifest_paths="$(printf '%s\n%s/.npmrc\n%s/**/package.json\n!%s/**/node_modules/**\n!%s/.git/**' "$lockfile" "$wd" "$wd" "$wd" "$wd")"
-            ;;
-          *)
-            echo "::error::Unsupported package-manager '$pm'. Expected 'auto', 'yarn', 'npm', or 'pnpm'."
-            exit 1
-            ;;
-        esac
+          let pm = "";
+          let useCorepack = false;
+          let corepackKey = "";
+          let corepackHome = "";
+          let shimDir = "";
 
-        cache_paths="${INPUT_CACHE_PATHS:-$default_cache_paths}"
-        manifest_paths="${INPUT_MANIFEST_PATHS:-$default_manifest_paths}"
+          if (pmSpec) {
+            const at = pmSpec.indexOf("@");
+            if (at <= 0 || at === pmSpec.length - 1) {
+              fail(`Invalid "packageManager" field "${pmSpec}" in ${pkgPath}. Expected "<name>@<version>" (e.g. "yarn@4.18.1" or "pnpm@10.28.2").`);
+            }
+            const name = pmSpec.slice(0, at);
+            if (name === "yarn" || name === "pnpm") {
+              pm = name;
+              useCorepack = true;
+              const label = pmSpec.split("+")[0].replace(/[^a-zA-Z0-9._-]/g, "-");
+              const hash = crypto.createHash("sha256").update(pmSpec).digest("hex").slice(0, 16);
+              corepackKey = `${label}-${hash}`;
+              corepackHome = process.env.COREPACK_HOME || path.join(
+                process.env.XDG_CACHE_HOME ?? process.env.LOCALAPPDATA ?? path.join(os.homedir(), process.platform === "win32" ? "AppData/Local" : ".cache"),
+                "node",
+                "corepack"
+              );
+              shimDir = path.join(process.env.RUNNER_TEMP || os.tmpdir(), "fast-setup-node-shims");
+              fs.mkdirSync(shimDir, { recursive: true });
+            } else if (name === "npm") {
+              pm = "npm";
+            } else {
+              fail(`Unsupported packageManager "${pmSpec}" in ${pkgPath}. Supported package managers are yarn, npm, and pnpm.`);
+            }
+          } else {
+            if (fs.existsSync(path.join(wd, "yarn.lock"))) {
+              fail(`Found yarn.lock in "${wd}" without a "packageManager" field in package.json. Add "packageManager": "yarn@<version>" to package.json so Corepack activates the pinned Yarn version.`);
+            }
+            if (fs.existsSync(path.join(wd, "pnpm-lock.yaml"))) {
+              fail(`Found pnpm-lock.yaml in "${wd}" without a "packageManager" field in package.json. Add "packageManager": "pnpm@<version>" to package.json so Corepack activates the pinned pnpm version.`);
+            }
+            if (fs.existsSync(path.join(wd, "npm-shrinkwrap.json")) || fs.existsSync(path.join(wd, "package-lock.json"))) {
+              pm = "npm";
+            } else {
+              fail(`Could not detect package manager in "${wd}". Add "packageManager" to package.json (yarn/pnpm) or commit a lockfile (package-lock.json or npm-shrinkwrap.json for npm).`);
+            }
+          }
 
-        delim="__FAST_SETUP_NODE_EOF__"
-        {
-          printf 'package-manager=%s\n' "$pm"
-          printf 'lockfile=%s\n' "$lockfile"
-          printf 'cache-paths<<%s\n%s\n%s\n' "$delim" "$cache_paths" "$delim"
-          printf 'manifest-paths<<%s\n%s\n%s\n' "$delim" "$manifest_paths" "$delim"
-        } >> "$GITHUB_OUTPUT"
+          const wdPosix = wd.replace(/\\/g, "/");
+          let lockfile;
+          let defaultCachePaths;
+          let defaultManifestPaths;
+
+          if (pm === "yarn") {
+            lockfile = `${wdPosix}/yarn.lock`;
+            defaultCachePaths = [
+              `${wdPosix}/**/node_modules`,
+              `!${wdPosix}/**/node_modules/**/node_modules`,
+              `${wdPosix}/.yarn/install-state.gz`,
+            ].join("\n");
+            defaultManifestPaths = [
+              `${wdPosix}/yarn.lock`,
+              `${wdPosix}/.yarnrc.yml`,
+              `${wdPosix}/**/package.json`,
+              `!${wdPosix}/**/node_modules/**`,
+              `!${wdPosix}/.yarn/**`,
+              `!${wdPosix}/.git/**`,
+            ].join("\n");
+          } else if (pm === "pnpm") {
+            lockfile = `${wdPosix}/pnpm-lock.yaml`;
+            defaultCachePaths = [
+              `${wdPosix}/**/node_modules`,
+              `!${wdPosix}/**/node_modules/**/node_modules`,
+            ].join("\n");
+            defaultManifestPaths = [
+              `${wdPosix}/pnpm-lock.yaml`,
+              `${wdPosix}/pnpm-workspace.yaml`,
+              `${wdPosix}/.npmrc`,
+              `${wdPosix}/**/package.json`,
+              `!${wdPosix}/**/node_modules/**`,
+              `!${wdPosix}/.git/**`,
+            ].join("\n");
+          } else {
+            lockfile = fs.existsSync(path.join(wd, "npm-shrinkwrap.json"))
+              ? `${wdPosix}/npm-shrinkwrap.json`
+              : `${wdPosix}/package-lock.json`;
+            defaultCachePaths = [
+              `${wdPosix}/**/node_modules`,
+              `!${wdPosix}/**/node_modules/**/node_modules`,
+            ].join("\n");
+            defaultManifestPaths = [
+              lockfile,
+              `${wdPosix}/.npmrc`,
+              `${wdPosix}/**/package.json`,
+              `!${wdPosix}/**/node_modules/**`,
+              `!${wdPosix}/.git/**`,
+            ].join("\n");
+          }
+
+          const cachePaths = (process.env.INPUT_CACHE_PATHS || "").trim() || defaultCachePaths;
+          const manifestPaths = (process.env.INPUT_MANIFEST_PATHS || "").trim() || defaultManifestPaths;
+          const delim = `EOF_${crypto.randomBytes(8).toString("hex")}`;
+
+          const lines = [
+            `package-manager=${pm}`,
+            `use-corepack=${useCorepack}`,
+            `corepack-home=${corepackHome}`,
+            `corepack-key=${corepackKey}`,
+            `shim-dir=${shimDir}`,
+            `lockfile=${lockfile}`,
+            `cache-paths<<${delim}\n${cachePaths}\n${delim}`,
+            `manifest-paths<<${delim}\n${manifestPaths}\n${delim}`,
+          ];
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, lines.join("\n") + "\n");
+        '
 
     # Exact-key lookup for the linked node_modules tree. No restore-keys:
     # reconciling a stale node_modules is slower than a clean install from the
@@ -145,48 +209,34 @@ runs:
         key: >-
           ${{ inputs.cache-key-prefix != '' && format('{0}-', inputs.cache-key-prefix) || '' }}node-modules-${{ steps.detect.outputs.package-manager }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(steps.detect.outputs.manifest-paths) }}
 
-    # Enable Corepack before actions/setup-node so the runner's system Corepack
-    # shim is wired even when setup-node installs Node >= 25 (no bundled Corepack).
-    - name: Enable Corepack shim (Unix)
-      if: >-
-        runner.os != 'Windows'
-        && steps.detect.outputs.package-manager != 'npm'
-        && (
-          inputs.enable-package-manager == 'true'
-          || steps.cache-node-modules.outputs.cache-hit != 'true'
-        )
-      shell: bash
-      env:
-        PM: ${{ steps.detect.outputs.package-manager }}
-      run: |
-        if command -v corepack >/dev/null 2>&1; then
-          corepack enable "$PM"
-        elif ! command -v "$PM" >/dev/null 2>&1; then
-          echo "::error::Neither corepack nor '$PM' is available on PATH."
-          exit 1
-        fi
+    # Restore Corepack's downloaded package manager cache so warm jobs invoke
+    # the pinned yarn/pnpm version without hitting the registry.
+    - name: Restore Corepack cache
+      id: cache-corepack
+      if: steps.detect.outputs.use-corepack == 'true'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.detect.outputs.corepack-home }}
+        key: >-
+          ${{ inputs.cache-key-prefix != '' && format('{0}-', inputs.cache-key-prefix) || '' }}corepack-${{ runner.os }}-${{ runner.arch }}-${{ steps.detect.outputs.corepack-key }}
 
-    - name: Enable Corepack shim (Windows)
-      if: >-
-        runner.os == 'Windows'
-        && steps.detect.outputs.package-manager != 'npm'
-        && (
-          inputs.enable-package-manager == 'true'
-          || steps.cache-node-modules.outputs.cache-hit != 'true'
-        )
+    # Create Corepack shims before actions/setup-node so the runner's system
+    # Corepack is captured even when setup-node installs Node >= 25 (no bundled
+    # Corepack). Shims are written into a dedicated directory that is prepended
+    # to GITHUB_PATH after setup-node, shadowing any global yarn/pnpm on PATH.
+    - name: Enable Corepack shim
+      id: enable-corepack
+      if: steps.detect.outputs.use-corepack == 'true'
       shell: bash
       env:
         PM: ${{ steps.detect.outputs.package-manager }}
+        SHIM_DIR: ${{ steps.detect.outputs.shim-dir }}
       run: |
         if command -v corepack >/dev/null 2>&1; then
-          if [ -d 'C:\npm\prefix' ]; then
-            corepack enable --install-directory 'C:\npm\prefix' "$PM"
-          else
-            corepack enable "$PM"
-          fi
-        elif ! command -v "$PM" >/dev/null 2>&1; then
-          echo "::error::Neither corepack nor '$PM' is available on PATH."
-          exit 1
+          corepack enable --install-directory "$SHIM_DIR" "$PM"
+          printf 'enabled=true\n' >> "$GITHUB_OUTPUT"
+        else
+          printf 'enabled=false\n' >> "$GITHUB_OUTPUT"
         fi
 
     - name: Setup Node.js
@@ -196,6 +246,41 @@ runs:
         node-version: ${{ inputs.node-version || (inputs.node-version-file == '' && '24' || '') }}
         node-version-file: ${{ inputs.node-version-file }}
         package-manager-cache: false
+
+    - name: Activate Corepack shim on PATH
+      if: steps.detect.outputs.use-corepack == 'true'
+      shell: bash
+      env:
+        PM: ${{ steps.detect.outputs.package-manager }}
+        SHIM_DIR: ${{ steps.detect.outputs.shim-dir }}
+        ALREADY_ENABLED: ${{ steps.enable-corepack.outputs.enabled }}
+      run: |
+        if [ "$ALREADY_ENABLED" != "true" ]; then
+          if command -v corepack >/dev/null 2>&1; then
+            corepack enable --install-directory "$SHIM_DIR" "$PM"
+          else
+            echo "::error::Corepack is required to activate '$PM' from packageManager in package.json, but corepack was not found on PATH."
+            exit 1
+          fi
+        fi
+        node -e "require('node:fs').appendFileSync(process.env.GITHUB_PATH, process.env.SHIM_DIR + '\n')"
+
+    - name: Populate Corepack cache
+      if: steps.detect.outputs.use-corepack == 'true' && steps.cache-corepack.outputs.cache-hit != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        PM: ${{ steps.detect.outputs.package-manager }}
+        COREPACK_ENABLE_DOWNLOAD_PROMPT: '0'
+      run: |
+        "$PM" --version
+
+    - name: Save Corepack cache
+      if: steps.detect.outputs.use-corepack == 'true' && steps.cache-corepack.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.detect.outputs.corepack-home }}
+        key: ${{ steps.cache-corepack.outputs.cache-primary-key }}
 
     - name: Resolve package manager cache folder
       id: pm-cache-dir
