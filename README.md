@@ -129,8 +129,7 @@ When set, `cache-paths` and `manifest-paths` are evaluated relative to the repos
 | `node-version` | No | `'24'` (if `node-version-file` is unset) | Node.js version spec passed to `actions/setup-node`. |
 | `node-version-file` | No | `''` | File containing the Node.js version spec (e.g. `.nvmrc`, `.node-version`, `package.json`). |
 | `package-manager` | No | `'auto'` | Package manager to use: `'auto'`, `'yarn'`, `'npm'`, or `'pnpm'`. |
-| `enable-package-manager` | No | `'false'` | Enable the Corepack shim (`yarn`/`pnpm`) even on a `node_modules` cache hit (`npm` is always available). |
-| `enable-yarn` | No | `'false'` | Alias for `enable-package-manager` when using Yarn. |
+| `enable-package-manager` | No | `'false'` | Enable the package manager CLI shim (`yarn`/`pnpm` via Corepack) even on a `node_modules` cache hit (`npm` is always available). |
 | `working-directory` | No | `'.'` | Directory containing `package.json` and lockfile. |
 | `cache-key-prefix` | No | `''` | Optional prefix prepended to cache keys (e.g. to scope caches by Node version or bust caches). |
 | `cache-paths` | No | `**/node_modules` (excluding nested `node_modules`), plus `.yarn/install-state.gz` for Yarn | Multiline glob patterns passed to `actions/cache` for the linked dependency tree. |

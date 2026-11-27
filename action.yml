@@ -21,11 +21,7 @@ inputs:
     required: false
     default: 'auto'
   enable-package-manager:
-    description: 'Ensure the Corepack shim (yarn/pnpm) is enabled even on a node_modules cache hit (npm is always available via Node.js)'
-    required: false
-    default: 'false'
-  enable-yarn:
-    description: 'Alias for enable-package-manager when using Yarn'
+    description: 'Ensure the package manager CLI shim (yarn/pnpm via Corepack) is enabled even on a node_modules cache hit (npm is always available via Node.js)'
     required: false
     default: 'false'
   working-directory:
@@ -81,7 +77,7 @@ runs:
         pm="${INPUT_PACKAGE_MANAGER:-auto}"
         if [ "$pm" = "auto" ]; then
           if [ -f "$wd/package.json" ]; then
-            declared="$(sed -n 's/.*"packageManager"[[:space:]]*:[[:space:]]*"\([^"@]*\)@.*/\1/p' "$wd/package.json" | head -n 1)"
+            declared="$(node -e 'try { const pm = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).packageManager; if (typeof pm === "string") console.log(pm.split("@")[0]); } catch {}' "$wd/package.json" 2>/dev/null || true)"
             case "$declared" in
               yarn|npm|pnpm) pm="$declared" ;;
             esac
@@ -157,7 +153,6 @@ runs:
         && steps.detect.outputs.package-manager != 'npm'
         && (
           inputs.enable-package-manager == 'true'
-          || (inputs.enable-yarn == 'true' && steps.detect.outputs.package-manager == 'yarn')
           || steps.cache-node-modules.outputs.cache-hit != 'true'
         )
       shell: bash
@@ -177,7 +172,6 @@ runs:
         && steps.detect.outputs.package-manager != 'npm'
         && (
           inputs.enable-package-manager == 'true'
-          || (inputs.enable-yarn == 'true' && steps.detect.outputs.package-manager == 'yarn')
           || steps.cache-node-modules.outputs.cache-hit != 'true'
         )
       shell: bash
